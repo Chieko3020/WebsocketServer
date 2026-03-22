@@ -1,0 +1,8 @@
+
+.specstory/**
+build/**
+cmake-build-**/
+out/**
+uploads/**
+log/**
+bench_output/**
