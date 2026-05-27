@@ -19,8 +19,7 @@ fi
 
 OUT="/tmp/wss_selftest_0rtt.$$"
 ./build/wss_server --port "$PORT" --cert "$CERT" --key "$KEY" \
-  --http-port "$HTTP_PORT" --http-root web \
-  --enable-0rtt 1 >"$OUT" 2>&1 &
+  --http-port 0 --enable-0rtt 1 --no-log-file >"$OUT" 2>&1 &
 PID=$!
 
 cleanup() {

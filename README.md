@@ -114,12 +114,20 @@
 ├── web/
 │   └── index.html
 ├── scripts/
-│   ├── bench_file_throughput.sh
-│   ├── bench_text_rtt.sh
 │   ├── gen_cert.sh
 │   ├── run_demo.sh
 │   ├── selftest_0rtt.sh
-│   └── test_0rtt_two_terminals.sh
+│   ├── test_0rtt_two_terminals.sh
+│   ├── bench_text_rtt.sh
+│   ├── bench_file_throughput.sh
+│   ├── bench_concurrent_hold.sh
+│   ├── bench_session_reuse.sh
+│   ├── bench_tls_handshake_compare.sh
+│   ├── bench_large_file.sh
+│   ├── run_all_benches.sh
+│   ├── run_valgrind.sh
+│   ├── functional_smoke.sh
+│   └── security_check.sh
 │
 
 ```
@@ -268,7 +276,7 @@ cd WebsocketServer
 
 **说明**：浏览器 **`WebSocket` 无法发送 `X-Nonce`**，不走 CLI 的 early data 写路径；浏览器演示请保持 **`enable_0rtt=0`**。
 
-#### 0-RTT 实验指标（记录实验与论文时可对照）
+#### 0-RTT 指标
 
 | 维度 | 判据（正面/说明） |
 |------|-------------------|
@@ -285,10 +293,18 @@ cd WebsocketServer
 |------|------|
 | `scripts/gen_cert.sh` | 生成 `server_cert.pem` / `server_key.pem` |
 | `scripts/run_demo.sh` | 服务端 + 客户端演示 |
-| `scripts/selftest_0rtt.sh` | 0-RTT / `X-Nonce` 0-RTT 测试脚步 |
+| `scripts/selftest_0rtt.sh` | 0-RTT / `X-Nonce` 0-RTT 测试脚本 |
 | `scripts/test_0rtt_two_terminals.sh` | 顺序跑服务端 + 两次客户端，带 `[A]/[B1]/[B2]` 日志前缀（默认端口 18555） |
 | `scripts/bench_text_rtt.sh` | 文本 RTT 压测，输出 `bench_output/*.csv` |
 | `scripts/bench_file_throughput.sh` | 文件吞吐压测 |
+| `scripts/bench_concurrent_hold.sh` | 并发承载能力压测（200/500/1000 连接） |
+| `scripts/bench_session_reuse.sh` | TLS 会话复用率压测 |
+| `scripts/bench_tls_handshake_compare.sh` | TLS 1.3 vs TLS 1.2 握手延迟对比 |
+| `scripts/bench_large_file.sh` | 大文件（10/100MB）传输成功率压测 |
+| `scripts/run_all_benches.sh` | 一键运行全部压测脚本 |
+| `scripts/run_valgrind.sh` | Valgrind 内存泄漏检测 |
+| `scripts/functional_smoke.sh` | 功能冒烟测试 |
+| `scripts/security_check.sh` | 安全测试（明文 TLS、错误握手、篡改 CRC） |
 
 ---
 

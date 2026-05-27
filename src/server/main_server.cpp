@@ -23,7 +23,8 @@ static void usage(const char* prog) {
                "[--enable-ticket <0|1>] [--session-timeout <sec>] [--enable-0rtt <0|1>] "
                "[--http-port <port|0>] [--http-root <dir>] "
                "[--log-dir <dir>] [--no-log-file] "
-               "[--ws-idle-timeout <sec>] [--ws-ping-interval <sec>]\n"
+               "[--ws-idle-timeout <sec>] [--ws-ping-interval <sec>] "
+               "[--min-tls-version <12|13>]\n"
             << "\n默认读取配置文件: config/wss_server.conf（若存在）。\n"
             << "端口、证书等可在配置文件中预置，不必全部写在命令行。\n";
 }
@@ -78,6 +79,7 @@ int main(int argc, char** argv) {
   bool enableFileLog = config_file::getBool(cfg, "log_file", true);
   int wsIdleTimeoutSec = config_file::getInt(cfg, "ws_idle_timeout", 0);
   int wsServerPingIntervalSec = config_file::getInt(cfg, "ws_ping_interval", 0);
+  int minTlsVersion = 13;
 
   // —— 第二遍：命令行覆盖 ——
   for (int i = 1; i < argc; ++i) {
@@ -110,6 +112,8 @@ int main(int argc, char** argv) {
       wsIdleTimeoutSec = std::atoi(argv[++i]);
     } else if (arg == "--ws-ping-interval" && i + 1 < argc) {
       wsServerPingIntervalSec = std::atoi(argv[++i]);
+    } else if (arg == "--min-tls-version" && i + 1 < argc) {
+      minTlsVersion = std::atoi(argv[++i]);
     } else {
       std::cerr << "[错误] 未知参数: " << arg << "\n";
       usage(argv[0]);
@@ -136,11 +140,13 @@ int main(int argc, char** argv) {
   LOG_INFO("入口", "启动参数解析完成，WSS端口=" + std::to_string(port) +
                        "，内置HTTP=" + (httpPort == 0 ? std::string("关闭") : ("端口=" + std::to_string(httpPort))) +
                        "，静态根目录=" + httpRoot +
-                       "，0-RTT实验=" + (enable0Rtt == 0 ? std::string("关闭") : std::string("开启")));
+                       "，0-RTT实验=" + (enable0Rtt == 0 ? std::string("关闭") : std::string("开启")) +
+                       "，min_tls=" + std::to_string(minTlsVersion));
 
   setenv("WSS_ENABLE_TICKET", enableTicket == 0 ? "0" : "1", 1);
   setenv("WSS_SESSION_TIMEOUT", std::to_string(sessionTimeout).c_str(), 1);
   setenv("WSS_ENABLE_0RTT", enable0Rtt == 0 ? "0" : "1", 1);
+  setenv("WSS_MIN_TLS_VERSION", std::to_string(minTlsVersion).c_str(), 1);
 
   WssServer server;
   // log_dir：Logger 写 wss_server.log（可 --no-log-file 关）；浏览器 POST /__wss_browser_log 仍用同目录写 wss_browser.log。

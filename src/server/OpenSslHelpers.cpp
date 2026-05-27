@@ -17,6 +17,7 @@
 
 #include <cstdlib>
 #include <stdexcept>
+#include <string>
 
 namespace openssl_helpers {
 
@@ -28,18 +29,33 @@ static void throwOnOpenSslError(const char* what) {
   throw std::runtime_error(std::string(what) + ": " + buf);
 }
 
-SSL_CTX* createServerContext(const std::string& certFile, const std::string& keyFile) {
+SSL_CTX* createServerContext(const std::string& certFile, const std::string& keyFile, int minTlsVersion) {
+  if (minTlsVersion <= 0) {
+    minTlsVersion = 13;
+    if (const char* v = std::getenv("WSS_MIN_TLS_VERSION")) {
+      try {
+        int parsed = std::stoi(v);
+        if (parsed == 12 || parsed == 13) minTlsVersion = parsed;
+      } catch (...) {
+      }
+    }
+  }
+
   LOG_INFO("TLS", "开始创建服务端SSL上下文");
-  // 创建服务端 SSL_CTX，底层使用 TLS_server_method。
   SSL_CTX* ctx = SSL_CTX_new(TLS_server_method());
   if (!ctx) {
     throwOnOpenSslError("SSL_CTX_new failed");
   }
 
-  // 强制只允许 TLS1.3，避免协商降级到旧版本。
-  // 注意：这里限定最小/最大版本都为 TLS1.3，保证行为可预期。
-  SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION);
-  SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION);
+  if (minTlsVersion <= 12) {
+    SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+    SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION);
+    LOG_INFO("TLS", "协议范围：TLS1.2～TLS1.3（对照实验）");
+  } else {
+    SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION);
+    SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION);
+    LOG_INFO("TLS", "协议范围：仅 TLS1.3");
+  }
 
   // 加载服务端证书。
   if (SSL_CTX_use_certificate_file(ctx, certFile.c_str(), SSL_FILETYPE_PEM) <= 0) {
@@ -104,7 +120,7 @@ SSL_CTX* createServerContext(const std::string& certFile, const std::string& key
     SSL_CTX_set_max_early_data(ctx, 0);  // 零表示「无 early data」：连接建立后直接 SSL_accept，无需 early 读阶段
   }
 
-  LOG_INFO("TLS", "服务端SSL上下文创建成功（TLS1.3）");
+  LOG_INFO("TLS", std::string("服务端SSL上下文创建成功（min_tls=") + std::to_string(minTlsVersion) + "）");
   LOG_INFO("TLS", std::string("会话参数：ticket=") + (enable_ticket ? "开启" : "关闭") +
                       "，session_timeout=" + std::to_string(timeout_seconds) + "秒");
   LOG_INFO("TLS", std::string("0-RTT实验开关：") + (enable_0rtt ? "开启" : "关闭"));

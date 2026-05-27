@@ -51,11 +51,26 @@ static void usage(const char* prog) {
                "[--text <msg>] [--file <path>] [--chunk-size <bytes>] "
                "[--enable-ticket <0|1>] [--session-timeout <sec>] [--enable-0rtt <0|1>] "
                "[--session-file <path>] [--log-dir <dir>] [--no-log-file] "
-               "[--client-ping-interval <sec>]\n"
+               "[--client-ping-interval <sec>] "
+               "[--handshake-only] [--hold-seconds <N>] [--corrupt-chunk <index>] "
+               "[--quiet] [--max-tls-version <12|13>]\n"
             << "  --session-file：TLS 会话 PEM 路径；与 --enable-0rtt 1 配合用于第二次连接 0-RTT early data（默认 $HOME/.cache/wss_client_session.pem）。\n"
             << "  --log-dir：除 stderr 外追加写入 <dir>/wss_client.log（默认 log）。\n"
             << "  --no-log-file：禁用客户端文件日志。\n"
-            << "  --client-ping-interval：CLI 周期性发送 WebSocket Ping 的间隔秒数，默认 10；0=不发送（依赖服务端 Ping）。\n";
+            << "  --client-ping-interval：CLI 周期性发送 WebSocket Ping 的间隔秒数，默认 10；0=不发送（依赖服务端 Ping）。\n"
+            << "  --handshake-only：完成 WebSocket 握手后跳过业务（可与 --hold-seconds 联用）；stdout 输出 WSS_BENCH 行。\n"
+            << "  --hold-seconds：握手后保持连接 N 秒（仅读/Ping 保活），用于并发压测。\n"
+            << "  --corrupt-chunk：上传时对指定分片 CRC 故意写错（安全测试）。\n"
+            << "  --quiet：压测模式，仅输出 WSS_BENCH 或错误。\n"
+            << "  --max-tls-version：客户端最高 TLS 版本（12 或 13，默认 13）。\n";
+}
+
+static void printWssBenchOk(int handshakeMs, int sessionReused) {
+  std::cout << "WSS_BENCH ok handshake_ms=" << handshakeMs << " session_reused=" << sessionReused << "\n";
+}
+
+static void printWssBenchFail(const std::string& reason) {
+  std::cout << "WSS_BENCH fail reason=" << reason << "\n";
 }
 
 #if OPENSSL_VERSION_NUMBER >= 0x10101000L
@@ -335,6 +350,11 @@ int main(int argc, char** argv) {
   // 与 wss_server 的 log_dir 对齐：CLI 追加写入 log/wss_client.log。
   std::string logDir = "log";
   bool enableClientFileLog = true;
+  bool handshakeOnly = false;
+  int holdSeconds = 0;
+  int corruptChunkIndex = -1;
+  bool quiet = false;
+  int maxTlsVersion = 13;
 
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
@@ -353,11 +373,26 @@ int main(int argc, char** argv) {
     else if (arg == "--no-log-file") enableClientFileLog = false;
     else if (arg == "--client-ping-interval" && i + 1 < argc)
       clientPingIntervalSec = std::atoi(argv[++i]);
+    else if (arg == "--handshake-only")
+      handshakeOnly = true;
+    else if (arg == "--hold-seconds" && i + 1 < argc)
+      holdSeconds = std::atoi(argv[++i]);
+    else if (arg == "--corrupt-chunk" && i + 1 < argc)
+      corruptChunkIndex = std::atoi(argv[++i]);
+    else if (arg == "--quiet")
+      quiet = true;
+    else if (arg == "--max-tls-version" && i + 1 < argc)
+      maxTlsVersion = std::atoi(argv[++i]);
     else {
       usage(argv[0]);
       return 2;
     }
   }
+
+  if (quiet) {
+    Logger::setMinLevel(LogLevel::Error);
+  }
+  const bool benchMode = handshakeOnly || holdSeconds > 0 || quiet;
 
   if (port == 0 || caFile.empty()) {
     usage(argv[0]);
@@ -412,6 +447,9 @@ int main(int argc, char** argv) {
   if (sock < 0) throw std::runtime_error("connect failed");
   LOG_INFO("客户端", "TCP连接建立成功");
 
+  // 计时起点：TCP 建连之后，仅测量 TLS 握手时间（排除 WSL2 环回接口的 TCP 开销）
+  const auto handshakeStart = std::chrono::steady_clock::now();
+
   // Read timeout so we can send periodic pings.
   timeval tv;
   tv.tv_sec = 1;
@@ -422,8 +460,13 @@ int main(int argc, char** argv) {
   // 仅 TLS 1.3，与服务器 OpenSslHelpers 行为对齐；后续 SSL_connect / SSL_write_early_data 均依赖此 ctx。
   SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
   if (!ctx) throw std::runtime_error("SSL_CTX_new failed");
-  SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION);
-  SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION);
+  if (maxTlsVersion <= 12) {
+    SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+    SSL_CTX_set_max_proto_version(ctx, TLS1_2_VERSION);
+  } else {
+    SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION);
+    SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION);
+  }
   // 客户端会话缓存：用于首次完整握手拿到 NewSessionTicket，第二次 SSL_set_session 恢复。
   SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_CLIENT);
   SSL_CTX_set_timeout(ctx, sessionTimeout);
@@ -471,11 +514,11 @@ int main(int argc, char** argv) {
   SSL_SESSION* sessFromFile = nullptr;  // 上次保存的会话（可能为 nullptr）
   uint32_t maxEarlyFromSession = 0;  // PEM 中记录的 max_early_data，决定能否 write_early_data
 #if OPENSSL_VERSION_NUMBER >= 0x10101000L
-  if (enable0Rtt != 0 && !sessionFile.empty()) {  // 首次连接无 PEM：走普通握手，save 后再二次连
+  if (!sessionFile.empty()) {
     sessFromFile = loadSessionPem(sessionFile);
     if (sessFromFile) {
-      maxEarlyFromSession = SSL_SESSION_get_max_early_data(sessFromFile);  // 常为 0 直到吸收 NST
-    } else {
+      maxEarlyFromSession = SSL_SESSION_get_max_early_data(sessFromFile);
+    } else if (enable0Rtt != 0) {
       LOG_INFO("TLS", "会话 PEM 未加载（文件不存在或格式错误）：" + sessionFile);
     }
   }
@@ -529,16 +572,21 @@ int main(int argc, char** argv) {
 #if OPENSSL_VERSION_NUMBER >= 0x10101000L
   // 首次连接：握手后读入 TLS 层 NST，更新内存中的 SSL_SESSION，使 max_early_data>0，再 save PEM。
   // 已 early 发送：101 已在 TLS 缓冲，禁止此处 SSL_read，否则 readUntilDoubleCrlf 永远等不到。
-  if (enable0Rtt != 0 && !sessionFile.empty() && !wroteEarlyData) {
-    timeval tvFast;
-    tvFast.tv_sec = 0;
-    tvFast.tv_usec = 200000;  // 200ms：避免阻塞过久
-    ::setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tvFast, sizeof(tvFast));
-    tlsAbsorbPostHandshakeForSession(ssl);
-    ::setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));  // 恢复主循环 1s 读超时
-    const SSL_SESSION* s = SSL_get0_session(ssl);
-    if (s) {
-      LOG_INFO("TLS", std::string("会话吸收后 max_early_data=") + std::to_string(SSL_SESSION_get_max_early_data(s)));
+  if (!sessionFile.empty() && !wroteEarlyData) {
+    if (enable0Rtt != 0) {
+      timeval tvFast;
+      tvFast.tv_sec = 0;
+      tvFast.tv_usec = 200000;
+      ::setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tvFast, sizeof(tvFast));
+      tlsAbsorbPostHandshakeForSession(ssl);
+      ::setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+      const SSL_SESSION* s = SSL_get0_session(ssl);
+      if (s && !quiet) {
+        LOG_INFO("TLS", std::string("会话吸收后 max_early_data=") +
+                         std::to_string(SSL_SESSION_get_max_early_data(s)));
+      }
+    } else {
+      tlsAbsorbPostHandshakeForSession(ssl);
     }
   }
   LOG_INFO("TLS", std::string("TLS_session_reused=") + (SSL_session_reused(ssl) ? "1" : "0"));
@@ -547,7 +595,7 @@ int main(int argc, char** argv) {
   if (!sessionFile.empty()) {
     if (saveSessionPem(ssl, sessionFile)) {
       LOG_INFO("TLS", "已保存 TLS 会话 PEM：" + sessionFile);
-    } else {
+    } else if (!quiet) {
       LOG_INFO("TLS", "未能写入会话文件（请检查目录是否存在及权限）");
     }
   }
@@ -567,6 +615,55 @@ int main(int argc, char** argv) {
   if (accept != expectedAccept) throw std::runtime_error("Sec-WebSocket-Accept mismatch");
 
   LOG_INFO("WebSocket", "WebSocket 握手成功");
+
+  const auto handshakeEnd = std::chrono::steady_clock::now();
+  const int handshakeMs = static_cast<int>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(handshakeEnd - handshakeStart).count());
+  const int sessionReused = SSL_session_reused(ssl) ? 1 : 0;
+  if (benchMode) {
+    printWssBenchOk(handshakeMs, sessionReused);
+  }
+
+  if (holdSeconds > 0) {
+    WebSocketStreamParser holdParser(false);
+    holdParser.setOpenMode();
+    std::string holdDummyAccept;
+    std::chrono::steady_clock::time_point lastPingSent = std::chrono::steady_clock::now();
+    const auto holdDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(holdSeconds);
+    auto holdReadOnce = [&]() {
+      uint8_t buf[8192];
+      int n = SSL_read(ssl, buf, sizeof(buf));
+      if (n > 0) {
+        std::vector<WsFrame> frames;
+        (void)holdParser.feed(buf, static_cast<std::size_t>(n), &holdDummyAccept, &frames);
+      }
+    };
+    auto holdSendPing = [&]() {
+      if (clientPingIntervalSec <= 0) return;
+      const auto now = std::chrono::steady_clock::now();
+      if (now - lastPingSent < std::chrono::seconds(clientPingIntervalSec)) return;
+      sslWriteAll(ssl, WebSocketCodec::buildClientPing({}));
+      lastPingSent = now;
+    };
+    while (std::chrono::steady_clock::now() < holdDeadline) {
+      holdSendPing();
+      holdReadOnce();
+    }
+    SSL_shutdown(ssl);
+    SSL_free(ssl);
+    SSL_CTX_free(ctx);
+    ::close(sock);
+    return 0;
+  }
+
+  if (handshakeOnly) {
+    SSL_shutdown(ssl);
+    SSL_free(ssl);
+    SSL_CTX_free(ctx);
+    ::close(sock);
+    return 0;
+  }
+
   if (clientPingIntervalSec > 0) {
     LOG_INFO("客户端", "已启用 CLI 客户端 Ping，间隔=" + std::to_string(clientPingIntervalSec) + "秒（DEBUG 级别可查看每次发送）");
   } else {
@@ -736,6 +833,9 @@ int main(int argc, char** argv) {
 
     CRC32 crc;
     uint32_t chunkCrc = crc.checksum(chunkBuf.data(), gotLen);
+    if (static_cast<int>(chunkIndex) == corruptChunkIndex) {
+      chunkCrc ^= 0xFFFFFFFFu;
+    }
 
     std::vector<uint8_t> chunkPayload;
     chunkPayload.push_back(MSG_FILE_CHUNK);
@@ -812,6 +912,9 @@ int main(int argc, char** argv) {
   LOG_INFO("客户端", "客户端流程执行完毕，连接已关闭");
   return 0;
   } catch (const std::exception& ex) {
+    if (quiet || handshakeOnly) {
+      printWssBenchFail(ex.what());
+    }
     LOG_ERROR("客户端", std::string("异常退出：") + ex.what());
     return 1;
   }

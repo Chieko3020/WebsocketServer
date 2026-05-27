@@ -179,6 +179,19 @@ struct Connection {
         last_activity(std::chrono::steady_clock::now()),
         last_ping(std::chrono::steady_clock::now()),
         last_server_ping_sent(std::chrono::steady_clock::now()) {}
+
+  ~Connection() {
+    // 延迟到析构再释放 SSL/fd：业务线程可能仍持有本连接的 shared_ptr。
+    if (ssl) {
+      SSL_shutdown(ssl);
+      SSL_free(ssl);
+      ssl = nullptr;
+    }
+    if (fd >= 0) {
+      ::close(fd);
+      fd = -1;
+    }
+  }
 };
 
 static void closeConnection(int epoll_fd, std::unordered_map<int, std::shared_ptr<Connection>>& conns,
@@ -188,21 +201,26 @@ static void closeConnection(int epoll_fd, std::unordered_map<int, std::shared_pt
   if (it == conns.end()) return;
 
   auto c = it->second;
+  {
+    std::lock_guard<std::mutex> lk(c->outbound_mu);
+    c->closing = true;
+  }
   conns.erase(it);
 
   epoll_event ev;
   std::memset(&ev, 0, sizeof(ev));
   epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, &ev);
 
-  if (c->ssl) {
-    SSL_shutdown(c->ssl);
-    SSL_free(c->ssl);
+  if (c->fd >= 0) {
+    ::close(c->fd);
+    c->fd = -1;
   }
-  ::close(fd);
+  // 不在此处 SSL_free：线程池任务可能仍持有 shared_ptr<Connection>。
   LOG_INFO("服务器", "连接已关闭，fd=" + std::to_string(fd) + "，连接ID=" + std::to_string(c->id));
 }
 
 static void updateInterest(int epoll_fd, int fd, bool want_write) {
+  if (fd < 0) return;
   // 函数：动态更新某连接在 epoll 中的关注事件。
   epoll_event ev;
   std::memset(&ev, 0, sizeof(ev));
@@ -341,49 +359,66 @@ static bool processWsInboundBuffer(int epoll_fd, std::unordered_map<int, std::sh
     if (frame.opcode == 0x1) {
       c->last_ping = std::chrono::steady_clock::now();
       auto payloadCopy = frame.payload;
-      pool.submit([&, c, payloadCopy, wake_fd]() mutable {
+      std::weak_ptr<Connection> weak = c;
+      pool.submit([weak, payloadCopy, wake_fd, epoll_fd, metrics]() mutable {
         try {
+          auto conn = weak.lock();
+          if (!conn) return;
           std::string text(payloadCopy.begin(), payloadCopy.end());
-          LOG_DEBUG("业务", "连接ID=" + std::to_string(c->id) + " 文本消息长度=" + std::to_string(text.size()));
+          LOG_DEBUG("业务", "连接ID=" + std::to_string(conn->id) + " 文本消息长度=" + std::to_string(text.size()));
           auto respFrame = WebSocketCodec::buildTextFrame(text);
+          bool notify = false;
           {
-            std::lock_guard<std::mutex> lk(c->outbound_mu);
+            std::lock_guard<std::mutex> lk(conn->outbound_mu);
+            if (conn->closing || conn->fd < 0 || !conn->ssl) return;
             OutboundItem item;
             item.data = std::move(respFrame);
             item.offset = 0;
-            c->outbound.push_back(std::move(item));
-            updatePeak(&metrics->tx_queue_peak, static_cast<uint64_t>(c->outbound.size()));
+            conn->outbound.push_back(std::move(item));
+            updatePeak(&metrics->tx_queue_peak, static_cast<uint64_t>(conn->outbound.size()));
+            notify = true;
           }
-          updateInterest(epoll_fd, c->fd, true);
-          notifyIoThreadOutbound(wake_fd);
+          if (notify) {
+            updateInterest(epoll_fd, conn->fd, true);
+            notifyIoThreadOutbound(wake_fd);
+          }
         } catch (...) {
-          LOG_WARN("业务", "连接ID=" + std::to_string(c->id) + " 文本消息处理异常（已忽略）");
+          LOG_WARN("业务", "文本消息处理异常（已忽略）");
         }
       });
     } else if (frame.opcode == 0x2) {
       c->last_ping = std::chrono::steady_clock::now();
       auto payloadCopy = frame.payload;
-      pool.submit([&, c, payloadCopy, wake_fd]() mutable {
+      std::weak_ptr<Connection> weak = c;
+      pool.submit([weak, payloadCopy, wake_fd, epoll_fd, metrics, &fileManager]() mutable {
         try {
+          auto conn = weak.lock();
+          if (!conn) return;
           std::vector<std::vector<uint8_t>> replies;
-          fileManager.handleClientMessage(c->id, payloadCopy, &replies);
+          fileManager.handleClientMessage(conn->id, payloadCopy, &replies);
           if (replies.empty()) return;
-          LOG_DEBUG("文件", "连接ID=" + std::to_string(c->id) + " 生成文件协议响应数量=" + std::to_string(replies.size()));
+          LOG_DEBUG("文件", "连接ID=" + std::to_string(conn->id) +
+                                " 生成文件协议响应数量=" + std::to_string(replies.size()));
+          bool notify = false;
           {
-            std::lock_guard<std::mutex> lk(c->outbound_mu);
+            std::lock_guard<std::mutex> lk(conn->outbound_mu);
+            if (conn->closing || conn->fd < 0 || !conn->ssl) return;
             for (auto& r : replies) {
               auto respFrame = WebSocketCodec::buildBinaryFrame(r);
               OutboundItem item;
               item.data = std::move(respFrame);
               item.offset = 0;
-              c->outbound.push_back(std::move(item));
+              conn->outbound.push_back(std::move(item));
             }
-            updatePeak(&metrics->tx_queue_peak, static_cast<uint64_t>(c->outbound.size()));
+            updatePeak(&metrics->tx_queue_peak, static_cast<uint64_t>(conn->outbound.size()));
+            notify = true;
           }
-          updateInterest(epoll_fd, c->fd, true);
-          notifyIoThreadOutbound(wake_fd);
+          if (notify) {
+            updateInterest(epoll_fd, conn->fd, true);
+            notifyIoThreadOutbound(wake_fd);
+          }
         } catch (...) {
-          LOG_WARN("文件", "连接ID=" + std::to_string(c->id) + " 文件消息处理异常（已忽略）");
+          LOG_WARN("文件", "文件消息处理异常（已忽略）");
         }
       });
     } else {
@@ -516,7 +551,12 @@ static int advanceTlsHandshake(int epoll_fd, std::unordered_map<int, std::shared
 // Returns true if outbound queue is fully drained.
 static bool flushOutbound(int epoll_fd, std::shared_ptr<Connection> c, ServerMetrics* metrics) {
   // 函数：刷新发送队列，尽量把待发送数据通过 SSL_write 发出。
+  if (c->fd < 0 || !c->ssl) return true;
   std::unique_lock<std::mutex> lk(c->outbound_mu);
+  if (c->closing && c->outbound.empty()) {
+    updateInterest(epoll_fd, c->fd, false);
+    return true;
+  }
   if (c->outbound.empty()) {
     // 队列为空时，主动关闭写关注，避免空转触发 EPOLLOUT。
     updateInterest(epoll_fd, c->fd, false);

@@ -11,8 +11,9 @@
 
 namespace openssl_helpers {
 
-// 创建并返回服务端 SSL_CTX，强制 TLS1.3，加载 PEM 证书和私钥。
-SSL_CTX* createServerContext(const std::string& certFile, const std::string& keyFile);
+// 创建并返回服务端 SSL_CTX，加载 PEM 证书和私钥。
+// minTlsVersion：12 表示 min=TLS1.2、max=TLS1.3（对照实验）；13 表示仅 TLS1.3（默认）。
+SSL_CTX* createServerContext(const std::string& certFile, const std::string& keyFile, int minTlsVersion = 0);
 
 // 在已创建好的 SSL_CTX 上生成一个客户端 SSL 会话对象。
 // 该接口在本项目服务端主路径中不是必须，但保留用于后续工具扩展或测试复用。

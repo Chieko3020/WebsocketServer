@@ -1,3 +1,4 @@
+# --- CMake / C++ 构建产物 ---
 build/
 cmake-build-*/
 out/
@@ -18,22 +19,45 @@ _deps/
 *.ilk
 *.pdb
 compile_commands.json
+
+# --- 运行时生成（证书、上传、日志、压测）---
+certs/
 uploads/
 log/
 bench_output/
 *.log
+
+# --- 答辩演示产物 ---
+demo/output/
+
+# --- 演示 / 测试临时文件 ---
+test_upload.bin
+test_*.bin
+
+# --- 毕业设计文书（Word/PDF/图片仅本地；不入代码库）---
+docs/
+
+# --- 编辑器 / AI 工具 ---
+.vscode/
+.idea/
+*.code-workspace
+.cursor/
+.specstory/
+
+# --- 系统与编辑器杂项 ---
+.DS_Store
+Thumbs.db
+desktop.ini
+*:Zone.Identifier
 *.tmp
 *.temp
 *.swp
 *.swo
 *~
-certs/
-.DS_Store
-Thumbs.db
-desktop.ini
-.vscode/
-.idea/
-*.code-workspace
+core
+core.*
+
+# --- Python（若脚本扩展）---
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -41,8 +65,6 @@ __pycache__/
 .ruff_cache/
 .venv/
 venv/
-.cursor/
-.specstory/
-docs/
-.gitignore
-./cursorindexingignore
+
+# --- 个人任务清单（可选本地）---
+TODO.md
