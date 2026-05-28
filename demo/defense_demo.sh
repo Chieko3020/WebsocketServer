@@ -1074,9 +1074,7 @@ main() {
                     exit 0
                     ;;
                 1|2|3|4|5|6|7|8|9)
-                    local sn
-                    sn="$(printf '%02d' "$choice")"
-                    prompt_params_for_step "$sn"
+                    prompt_params_for_step "$(printf '%02d' "$choice")"
                     run_single_step "$choice"
                     press_any_key
                     ;;
@@ -1102,6 +1100,9 @@ main() {
                     echo -e "${RED}用法: $0 --step <编号>${NC}"
                     exit 1
                 fi
+                local s
+                s="$(printf '%02d' "$((10#$2))")"
+                prompt_params_for_step "$s"
                 run_single_step "$((10#$2))"
                 ;;
             --list)
