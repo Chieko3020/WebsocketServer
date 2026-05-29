@@ -90,14 +90,11 @@ void Logger::log(LogLevel level, const std::string& module, const std::string& m
   std::lock_guard<std::mutex> lk(mu_);
   // 级别过滤：低于阈值直接返回，减少无效日志开销。
   if (static_cast<int>(level) < static_cast<int>(min_level_)) return;
-  // 输出规范统一为“tag:message”风格：
-  // - tag 使用模块名（module）；
-  // - message 使用调用方传入文本；
-  // - 同时保留时间与级别前缀，便于检索与排障。
+  // 输出格式：[时间][中文级别][模块]：消息
   std::ostringstream line;
   line << "[" << nowString() << "]"
        << "[" << levelToChinese(level) << "]"
-       << " " << module << ":" << message << "\n";
+       << "[" << module << "]：" << message << "\n";
   const std::string s = line.str();
   std::cerr << s;
   if (file_out_ && file_out_->good()) {
